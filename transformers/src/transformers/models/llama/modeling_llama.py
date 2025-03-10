@@ -356,6 +356,7 @@ class LlamaAttention(nn.Module):
         past_key_value: Optional[Cache] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         if "padding_mask" in kwargs:
@@ -403,8 +404,11 @@ class LlamaAttention(nn.Module):
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
+        ## FastV
+        kv_seq_len = kv_seq_len if cache_position is None else cache_position.shape[-1]
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
+            cache_kwargs["cache_position"] = cache_position
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
@@ -672,6 +676,7 @@ class LlamaSdpaAttention(LlamaAttention):
         past_key_value: Optional[Cache] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         if output_attentions:
             # TODO: Improve this warning with e.g. `model.config.attn_implementation = "manual"` once this is implemented.
@@ -686,6 +691,7 @@ class LlamaSdpaAttention(LlamaAttention):
                 past_key_value=past_key_value,
                 output_attentions=output_attentions,
                 use_cache=use_cache,
+                cache_position=cache_position,
             )
 
         bsz, q_len, _ = hidden_states.size()
@@ -705,8 +711,11 @@ class LlamaSdpaAttention(LlamaAttention):
 
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
+        ## FastV
+        kv_seq_len = kv_seq_len if cache_position is None else cache_position.shape[-1]
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
+            cache_kwargs["cache_position"] = cache_position
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
@@ -983,6 +992,7 @@ class LlamaModel(LlamaPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        fastv_config: Optional[dict] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -1052,7 +1062,31 @@ class LlamaModel(LlamaPreTrainedModel):
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
 
-        for decoder_layer in self.layers:
+        ## FastV implementation here.
+
+        # 1. validate and obtain fastv configs
+        use_fastv = False if fastv_config is None else fastv_config["use_fastv"]
+        if use_fastv:
+            # validate fastv-config
+            fastv_args = ("fastv_k", "fastv_r", "image_token_start_index", "image_token_length")
+            if any(key not in fastv_config for key in fastv_args):
+                raise AssertionError("All fastv configs should be specified in `fastv_config`.")
+            if not output_attentions:
+                raise AssertionError("output_attentions must be set to be True when using fastv.")
+            # obtain fastv configs
+            fastv_k = fastv_config["fastv_k"]
+            fastv_r = fastv_config["fastv_r"]
+            image_token_start_index = fastv_config["image_token_start_index"]
+            image_token_length = fastv_config["image_token_length"]
+            # compute the number of tokens retaining after token pruning
+            n_tokens = int(image_token_length * fastv_r)
+            image_token_end_index = image_token_start_index + image_token_length
+            device = input_ids.device if input_ids is not None else inputs_embeds.device
+            # compute total number of tokens
+            # seq_length_with_past = seq_length + past_key_values_length
+
+        cache_position = None
+        for index, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -1067,6 +1101,51 @@ class LlamaModel(LlamaPreTrainedModel):
                     use_cache,
                 )
             else:
+                # 2. prune tokens in layer `fastv_k` when `use_fastv=True`
+                if use_fastv and index == fastv_k and past_key_values_length > 0:
+                    # NOTE: We don't prune vision tokens in the first forward pass for obtaining the KV Cache of the vision tokens.
+                    # (1) Obtain attention matrix in the previous layer, of shape (batch_size, n_heads, seq_len, seq_len)
+                    attn = layer_outputs[1]
+                    # (2) Get last token attention, of shape (batch_size, n_heads, seq_len)
+                    attn = attn[:, :, -1, :]
+                    # (3) Average attention scores across all heads, of shape (batch_size, seq_len)
+                    attn = torch.mean(attn, dim=1)
+                    # (4) Get vision token attentions, of shape (batch_size, image_token_length)
+                    attn = attn[:, image_token_start_index:image_token_end_index]
+                    # (5) Get the indices of the most important vision tokens, of shape (batch_size, n_tokens)
+                    indices = (
+                        torch.topk(attn, k=n_tokens, dim=-1).indices.sort().values
+                        + image_token_start_index
+                    )
+                    # (6) Combine the indices of system tokens and text tokens, of shape(batch_size, seq_length_with_past)
+                    indices = torch.cat(
+                        [
+                            torch.arange(image_token_start_index, device=device).expand(
+                                batch_size, -1
+                            ),
+                            indices,
+                            torch.arange(
+                                image_token_end_index,
+                                seq_length + past_key_values_length,
+                                device=device,
+                            ).expand(batch_size, -1),
+                        ],
+                        dim=-1,
+                    )
+                    new_seq_length_with_past_key_values = indices.shape[-1]
+                    # (7) Generate new attention mask
+                    attention_mask = _prepare_4d_causal_attention_mask(
+                        torch.ones(
+                            (batch_size, new_seq_length_with_past_key_values),
+                            device=device,
+                            dtype=torch.bool,
+                        ),
+                        (batch_size, seq_length),
+                        inputs_embeds,
+                        new_seq_length_with_past_key_values,
+                    )
+                    cache_position = indices
+                
                 layer_outputs = decoder_layer(
                     hidden_states,
                     attention_mask=attention_mask,
@@ -1074,6 +1153,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     past_key_value=past_key_values,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
+                    cache_position=cache_position,
                 )
 
             hidden_states = layer_outputs[0]
@@ -1147,6 +1227,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        fastv_config: Optional[dict] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
         Args:
@@ -1190,6 +1271,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            fastv_config=fastv_config,
         )
 
         hidden_states = outputs[0]
