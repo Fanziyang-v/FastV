@@ -122,6 +122,8 @@ def eval_model(args):
             num_beams=args.num_beams,
             max_new_tokens=args.max_new_tokens,
             use_cache=True,
+            fastv_config=args.fastv_config,
+            output_attentions=True,
         )
 
     outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
