@@ -1079,7 +1079,7 @@ class LlamaModel(LlamaPreTrainedModel):
             image_token_start_index = fastv_config["image_token_start_index"]
             image_token_length = fastv_config["image_token_length"]
             # compute the number of tokens retaining after token pruning
-            n_tokens = int(image_token_length * fastv_r)
+            n_tokens = round(image_token_length * (1 - fastv_r))
             image_token_end_index = image_token_start_index + image_token_length
             device = input_ids.device if input_ids is not None else inputs_embeds.device
             # compute total number of tokens
