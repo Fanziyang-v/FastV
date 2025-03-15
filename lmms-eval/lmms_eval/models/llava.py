@@ -380,7 +380,16 @@ class Llava(lmms):
                 gen_kwargs["top_p"] = None
             if "num_beams" not in gen_kwargs:
                 gen_kwargs["num_beams"] = 1
-
+            
+            # prepare `fasv_config` for FastV
+            if "fastv_k" in gen_kwargs:
+                fastv_k = gen_kwargs.pop("fastv_k", None)
+                fastv_r = gen_kwargs.pop("fastv_r", None)
+                image_token_start_index = gen_kwargs.pop("image_token_start_index", None)
+                image_token_length = gen_kwargs.pop("image_token_length", None)
+                fastv_config = dict(fastv_k=fastv_k, fastv_r=fastv_r, image_token_start_index=image_token_start_index, image_token_length=image_token_length)
+                gen_kwargs["fastv_config"] = fastv_config
+                print(f"Fastv activated with config: {fastv_config}")
             input_ids_list = [tokenizer_image_token(prompt, self.tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt") for prompt in question_input]
             pad_token_ids = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
             input_ids = self.pad_sequence(input_ids_list, batch_first=True, padding_value=pad_token_ids).to(self.device)
@@ -400,6 +409,7 @@ class Llava(lmms):
                     num_beams=gen_kwargs["num_beams"],
                     max_new_tokens=gen_kwargs["max_new_tokens"],
                     use_cache=self.use_cache,
+                    fastv_config=gen_kwargs.get("fastv_config", None),
                 )
                 text_outputs = self.tokenizer.batch_decode(cont, skip_special_tokens=True)
             except Exception as e:
