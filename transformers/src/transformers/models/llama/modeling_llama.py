@@ -1065,14 +1065,12 @@ class LlamaModel(LlamaPreTrainedModel):
         ## FastV implementation here.
 
         # 1. validate and obtain fastv configs
-        use_fastv = False if fastv_config is None else fastv_config["use_fastv"]
+        use_fastv = fastv_config is not None
         if use_fastv:
             # validate fastv-config
             fastv_args = ("fastv_k", "fastv_r", "image_token_start_index", "image_token_length")
             if any(key not in fastv_config for key in fastv_args):
                 raise AssertionError("All fastv configs should be specified in `fastv_config`.")
-            if not output_attentions:
-                raise AssertionError("output_attentions must be set to be True when using fastv.")
             # obtain fastv configs
             fastv_k = fastv_config["fastv_k"]
             fastv_r = fastv_config["fastv_r"]
@@ -1086,6 +1084,7 @@ class LlamaModel(LlamaPreTrainedModel):
             # seq_length_with_past = seq_length + past_key_values_length
 
         cache_position = None
+        old_output_attentions = output_attentions
         for index, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -1101,51 +1100,57 @@ class LlamaModel(LlamaPreTrainedModel):
                     use_cache,
                 )
             else:
-                # 2. prune tokens in layer `fastv_k` when `use_fastv=True`
-                if use_fastv and index == fastv_k and past_key_values_length > 0:
-                    # NOTE: We don't prune vision tokens in the first forward pass for obtaining the KV Cache of the vision tokens.
-                    # (1) Obtain attention matrix in the previous layer, of shape (batch_size, n_heads, seq_len, seq_len)
-                    attn = layer_outputs[1]
-                    # (2) Get last token attention, of shape (batch_size, n_heads, seq_len)
-                    attn = attn[:, :, -1, :]
-                    # (3) Average attention scores across all heads, of shape (batch_size, seq_len)
-                    attn = torch.mean(attn, dim=1)
-                    # (4) Get vision token attentions, of shape (batch_size, image_token_length)
-                    attn = attn[:, image_token_start_index:image_token_end_index]
-                    # (5) Get the indices of the most important vision tokens, of shape (batch_size, n_tokens)
-                    indices = (
-                        torch.topk(attn, k=n_tokens, dim=-1).indices.sort().values
-                        + image_token_start_index
-                    )
-                    # (6) Combine the indices of system tokens and text tokens, of shape(batch_size, seq_length_with_past)
-                    indices = torch.cat(
-                        [
-                            torch.arange(image_token_start_index, device=device).expand(
-                                batch_size, -1
-                            ),
-                            indices,
-                            torch.arange(
-                                image_token_end_index,
-                                seq_length + past_key_values_length,
+                if use_fastv and past_key_values_length > 0:
+                    # 2. we need to set `output_attentions=True` in the layer `fastv_k - 1` to obtain the attention for token pruning
+                    if index == fastv_k -1:
+                        output_attentions = True
+                    elif index == fastv_k:
+                        # restore the original value of `output_attentions`
+                        output_attentions = old_output_attentions
+                        # 3. prune tokens in layer `fastv_k` when `use_fastv=True`
+                        # NOTE: We don't prune vision tokens in the first forward pass for obtaining the KV Cache of the vision tokens.
+                        # (1) Obtain attention matrix in the previous layer, of shape (batch_size, n_heads, seq_len, seq_len)
+                        attn = layer_outputs[1]
+                        # (2) Get last token attention, of shape (batch_size, n_heads, seq_len)
+                        attn = attn[:, :, -1, :]
+                        # (3) Average attention scores across all heads, of shape (batch_size, seq_len)
+                        attn = torch.mean(attn, dim=1)
+                        # (4) Get vision token attentions, of shape (batch_size, image_token_length)
+                        attn = attn[:, image_token_start_index:image_token_end_index]
+                        # (5) Get the indices of the most important vision tokens, of shape (batch_size, n_tokens)
+                        indices = (
+                            torch.topk(attn, k=n_tokens, dim=-1).indices.sort().values
+                            + image_token_start_index
+                        )
+                        # (6) Combine the indices of system tokens and text tokens, of shape(batch_size, seq_length_with_past)
+                        indices = torch.cat(
+                            [
+                                torch.arange(image_token_start_index, device=device).expand(
+                                    batch_size, -1
+                                ),
+                                indices,
+                                torch.arange(
+                                    image_token_end_index,
+                                    seq_length + past_key_values_length,
+                                    device=device,
+                                ).expand(batch_size, -1),
+                            ],
+                            dim=-1,
+                        )
+                        new_seq_length_with_past_key_values = indices.shape[-1]
+                        # (7) Generate new attention mask
+                        attention_mask = _prepare_4d_causal_attention_mask(
+                            torch.ones(
+                                (batch_size, new_seq_length_with_past_key_values),
                                 device=device,
-                            ).expand(batch_size, -1),
-                        ],
-                        dim=-1,
-                    )
-                    new_seq_length_with_past_key_values = indices.shape[-1]
-                    # (7) Generate new attention mask
-                    attention_mask = _prepare_4d_causal_attention_mask(
-                        torch.ones(
-                            (batch_size, new_seq_length_with_past_key_values),
-                            device=device,
-                            dtype=torch.bool,
-                        ),
-                        (batch_size, seq_length),
-                        inputs_embeds,
-                        new_seq_length_with_past_key_values,
-                    )
-                    cache_position = indices
-                
+                                dtype=torch.bool,
+                            ),
+                            (batch_size, seq_length),
+                            inputs_embeds,
+                            new_seq_length_with_past_key_values,
+                        )
+                        cache_position = indices
+
                 layer_outputs = decoder_layer(
                     hidden_states,
                     attention_mask=attention_mask,
@@ -1161,7 +1166,7 @@ class LlamaModel(LlamaPreTrainedModel):
             if use_cache:
                 next_decoder_cache = layer_outputs[2 if output_attentions else 1]
 
-            if output_attentions:
+            if old_output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
         hidden_states = self.norm(hidden_states)
